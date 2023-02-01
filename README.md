@@ -1,2 +1,1 @@
-# project_uro_full
-Scripts and data for project Uro
+Scripts and data for the RAD-Seq population genetic analysis for Project Uro.
