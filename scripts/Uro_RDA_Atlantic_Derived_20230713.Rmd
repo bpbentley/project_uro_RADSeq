@@ -1,0 +1,826 @@
+---
+title: "pRDAs for Atlantic only to predict Pacific"
+author: "Blair Bentley"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "D:/Postdocs/UMass/Snails/FINAL_rerun")
+```
+
+
+### Load libraries
+```{r, error=FALSE, message=FALSE}
+
+library(pegas)
+library(ggplot2)
+library(raster)
+#library(rgdal)
+library(LEA)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(RColorBrewer)
+library(ggpubr)
+library(vegan)
+library(qvalue)
+library(robust)
+#library(WMDB)
+library(ggVennDiagram)
+library(cowplot)
+library(corrplot)
+#library(rgeos)
+library(adegenet)
+library(vcfR)
+library(SoDA)
+library(adespatial)
+library(kableExtra)
+library(reshape2)
+
+```
+
+### Read in the genotype data and impute missing values (RDA can't handle missing values)
+#### Interpolation = most common genotype across ALL individuals (Atlantic & Pacific)
+```{r}
+vcf <- vcfR::read.vcfR("Re_analysis_2023/PopGen/Data/final_data.vcf")
+pop <- read.table("Re_analysis_2023/PopGen//Data/popmapFiltered.txt", header=T, stringsAsFactors = TRUE)
+colnames(pop)<-c("Indiv","STRATA")
+
+genotype_df <- extract.gt(vcf, return.alleles = F)
+genotype_df <- sub("0/0", "0", genotype_df)
+genotype_df <- sub("0/1", "1", genotype_df)
+genotype_df <- sub("1/1", "2", genotype_df)
+genotype_df <- t(genotype_df)
+
+Genotypes = genotype_df
+row.names(Genotypes) <- gsub("_.*","",row.names(Genotypes))
+
+#Genotypes <- read.table("./Re_analysis_2023/PopGen/Data/Uro_Final_Filtered.raw", header = T)
+#rownames(Genotypes)<-Genotypes$FID
+#Genotypes<-Genotypes[,7:ncol(Genotypes)]
+sum(is.na(Genotypes))
+sum(is.na(Genotypes))/(ncol(Genotypes)*nrow(Genotypes))*100 # Percent missing data to be interpolated
+
+Genotypes <- apply(Genotypes, 2, function(x) replace(x, is.na(x), as.numeric(names(which.max(table(x))))))
+sum(is.na(Genotypes)) # 0 = all NAs replaced
+Genotypes<-as.data.frame(Genotypes)
+colnames(Genotypes)<-gsub("X","",gsub("//.",":",colnames(Genotypes)))
+
+```
+
+### Add metadata & filter out Pacific Popns
+```{r}
+samples<-row.names(Genotypes)
+Genotypes <- as.data.frame(sapply(Genotypes, as.numeric))
+row.names(Genotypes)<-samples
+
+Genotypes$Pop<-substr(rownames(Genotypes), 1, 2)
+
+Atlantic<-Genotypes[Genotypes$Pop != "WP" &
+                      Genotypes$Pop != "CP" &
+                      Genotypes$Pop != "RB" &
+                      Genotypes$Pop != "HM" &
+                      Genotypes$Pop != "TO",]
+
+```
+
+### Convert to allele ferquencies
+```{r, warning=F, message=F}
+AllFreq <- aggregate(Atlantic, by = list(Atlantic$Pop), function(x) mean(x, na.rm = T)/2)
+row.names(AllFreq) <- as.character(AllFreq$Group.1)
+#write.csv(AllFreq, file = "D:/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/PopGen/AF_preds/AllFreq.csv", quote = F,
+#          row.names = F)
+```
+
+### Filter for rare alleles
+```{r}
+## Filtering on MAF
+AllFreq[,c(1,7673)]<-NULL
+#AllFreq <- AllFreq[,-which(freq_mean>=0.95 | freq_mean<=0.05)]
+AllFreq<-AllFreq[, colMeans(AllFreq, na.rm = TRUE) >= 0.05, drop = FALSE]
+
+## Ordering loci based on their scaffold
+AllFreq <- AllFreq[,order(colnames(AllFreq))]
+#AllFreq <- AllFreq[,(1:6002)]
+
+```
+
+### Environmental & coordinate data:
+```{r}
+Env<-read.csv(file="./Re_analysis_2023/PopGen/environment_data/In_situ/environmental_summary_stats.csv",
+              header = T)
+rownames(Env)<-Env$Site
+Env$Site<-NULL
+Env <- scale(Env, center=TRUE, scale=TRUE)
+scale_env <- attr(Env, 'scaled:scale')
+center_env <- attr(Env, 'scaled:center')
+Env <- as.data.frame(Env)
+Env <- dplyr::select(Env, annual_min, annual_mean, annual_max, annual_range)
+
+Coordinates<-read.csv(file="./Re_analysis_2023/PopGen/Uro_sites.csv")
+Coordinates<-Coordinates[,c(1:3)]
+colnames(Coordinates) <- c("Population", "Latitude", "Longitude")
+
+Env<-Env[rownames(Env) != "WP"&
+           rownames(Env) != "CP"&
+           rownames(Env) != "RB"&
+           rownames(Env) != "HM"&
+           rownames(Env) != "TO",]
+
+Coordinates<-Coordinates[Coordinates$Population != "WP"&
+           Coordinates$Population != "CP"&
+           Coordinates$Population != "RB"&
+           Coordinates$Population != "HM"&
+           Coordinates$Population != "TO",]
+```
+
+### db-MEM
+```{r}
+geo <- Coordinates[, c(2:3)]
+geo
+geo$CAR <- geoXY(geo$Latitude, geo$Longitude)
+geo
+
+euclidian_distances <- dist(geo$CAR, method="euclidean")
+
+dbMEM <- dbmem(euclidian_distances, MEM.autocor = "non-null", store.listw = TRUE)
+names(dbMEM)
+
+dbMEM.vectors <- as.data.frame(dbMEM)
+
+dbmem.mod0 <- rda(AllFreq ~ 1, dbMEM.vectors)
+dbmem.mod1 <- rda(AllFreq ~ ., dbMEM.vectors)
+
+dbmem.all.ord <- ordistep(dbmem.mod0, scope = formula(dbmem.mod1), direction = "both", permutations = 1000)
+dbmem.all.ord$anova
+dbmem.sub <- dbMEM.vectors[,c(1,2)]
+```
+
+
+### Inferring population structure:
+```{r}
+### Supposed to be on "neutral" loci, but applied to all here...
+
+## Running a PCA on neutral genetic markers
+pca <- rda(AllFreq, scale=T) # PCA in vegan uses the rda() call without any predictors
+
+screeplot(pca, type = "barplot", npcs=20, main="PCA Eigenvalues")
+
+## Neutral population structure table
+PCs <- scores(pca, choices=c(1:2), display="sites", scaling=0)
+PopStruct <- data.frame(Population = row.names(AllFreq), PCs)
+colnames(PopStruct) <- c("Population", "PC1", "PC2")
+```
+
+### Merge variables
+```{r}
+Variables <- data.frame(dbmem.sub, PopStruct[,-1], Env)
+```
+
+```{r}
+RDA0 <- rda(AllFreq ~ 1,  Variables)
+RDAfull <- rda(AllFreq ~ annual_min + annual_max + annual_range + annual_mean, Variables)
+
+mod <- ordiR2step(RDA0, RDAfull, Pin = 0.01, R2permutations = 1000, R2scope = T)
+```
+
+```{r}
+pRDAfull <- rda(AllFreq ~ PC1 + PC2 + MEM1 + MEM2 + annual_max + annual_mean + annual_min + annual_range,  Variables)
+RsquareAdj(pRDAfull)
+
+anova(pRDAfull)
+```
+
+```{r}
+pRDAclim <- rda(AllFreq ~ annual_max + annual_min + annual_mean + annual_range + Condition(MEM1 + MEM2 + PC1 + PC2),  Variables)
+RsquareAdj(pRDAclim)
+
+anova(pRDAclim)
+```
+
+```{r}
+pRDAstruct <- rda(AllFreq ~ PC1 + PC2 + Condition(MEM1 + MEM2 + annual_max + annual_mean + annual_min + annual_range),  Variables)
+RsquareAdj(pRDAstruct)
+
+anova(pRDAstruct)
+```
+
+```{r}
+pRDAgeog <- rda(AllFreq ~ MEM1 + MEM2 + Condition(annual_max + annual_min + annual_mean + annual_range + PC1 + PC2),  Variables)
+RsquareAdj(pRDAgeog)
+
+anova(pRDAgeog)
+```
+
+```{r}
+RDA_env <- rda(AllFreq ~ annual_max + annual_min + annual_mean + annual_range + Condition(PC1 + PC2 + + MEM1 + MEM2),  Variables)
+screeplot(RDA_env, main="Eigenvalues of constrained axes")
+
+signif.pRDA <- anova.cca(RDA_env, parallel=getOption("mc.cores")) # default is permutation=999
+signif.pRDA # Non-significant...
+
+signif.axis <- anova.cca(RDA_env, by="axis", parallel=getOption("mc.cores"))
+signif.axis
+
+vif.cca(RDA_env)
+
+source("./Re_analysis_2023/scripts/rdadapt.R")
+
+rdadapt_env<-rdadapt(RDA_env, 3)
+```
+
+```{r}
+## P-values threshold after Bonferroni correction
+thres_env <- 0.01/length(rdadapt_env$p.values)
+
+## Identifying the loci that are below the p-value threshold
+outliers <- data.frame(Loci = colnames(AllFreq)[which(rdadapt_env$p.values<thres_env)], p.value = rdadapt_env$p.values[which(rdadapt_env$p.values<thres_env)], contig = unlist(lapply(strsplit(colnames(AllFreq)[which(rdadapt_env$p.values<thres_env)], split = "_"), function(x) x[1])))
+
+## Top hit outlier per contig
+outliers <- outliers[order(outliers$contig, outliers$p.value),]
+
+## List of outlier names
+outliers_rdadapt_env <- as.character(outliers$Loci[!duplicated(outliers$contig)])
+```
+
+```{r}
+## Formatting table for ggplot
+locus_scores <- scores(RDA_env, choices=c(1:3), display="species", scaling="none") # vegan references "species", here these are the loci
+TAB_loci <- data.frame(names = row.names(locus_scores), locus_scores)
+TAB_loci$type <- "Neutral"
+TAB_loci$type[TAB_loci$names%in%outliers$Loci] <- "All outliers"
+TAB_loci$type[TAB_loci$names%in%outliers_rdadapt_env] <- "Top outliers"
+TAB_loci$type <- factor(TAB_loci$type, levels = c("Neutral", "All outliers", "Top outliers"))
+TAB_loci <- TAB_loci[order(TAB_loci$type),]
+TAB_var <- as.data.frame(scores(RDA_env, choices=c(1,2), display="bp")) # pull the biplot scores
+
+## Biplot of RDA loci and variables scores
+ggplot() +
+  geom_hline(yintercept=0, linetype="dashed", color = gray(.80), size=0.6) +
+  geom_vline(xintercept=0, linetype="dashed", color = gray(.80), size=0.6) +
+  geom_point(data = TAB_loci, aes(x=RDA1*20, y=RDA2*20, colour = type), size = 1.4) +
+  scale_color_manual(values = c("gray90", "#F9A242FF", "#6B4596FF")) +
+  geom_segment(data = TAB_var, aes(xend=RDA1, yend=RDA2, x=0, y=0), colour="black", size=0.15, linetype=1, arrow=arrow(length = unit(0.02, "npc"))) +
+  geom_text(data = TAB_var, aes(x=1.1*RDA1, y=1.1*RDA2, label = row.names(TAB_var)), size = 2.5, family = "Times") +
+  xlab("RDA 1") + ylab("RDA 2") +
+  facet_wrap(~"RDA space") +
+  guides(color=guide_legend(title="Locus type")) +
+  theme_bw(base_size = 11, base_family = "Times") +
+  theme(panel.background = element_blank(), legend.background = element_blank(), panel.grid = element_blank(), plot.background = element_blank(), legend.text=element_text(size=rel(.8)), strip.text = element_text(size=11))
+```
+
+```{r}
+## Manhattan plot
+Outliers <- rep("Neutral", length(colnames(AllFreq)))
+Outliers[colnames(AllFreq)%in%outliers$Loci] <- "All outliers"
+Outliers[colnames(AllFreq)%in%outliers_rdadapt_env] <- "Top outliers"
+Outliers <- factor(Outliers, levels = c("Neutral", "All outliers", "Top outliers"))
+TAB_manhatan <- data.frame(pos = 1:length(colnames(AllFreq)), 
+                           pvalues = rdadapt_env$p.values, 
+                           Outliers = Outliers)
+TAB_manhatan <- TAB_manhatan[order(TAB_manhatan$Outliers),]
+ggplot(data = TAB_manhatan) +
+  geom_point(aes(x=pos, y=-log10(pvalues), col = Outliers), size=1.4) +
+  scale_color_manual(values = c("gray90", "#F9A242FF", "#6B4596FF")) +
+  xlab("Loci") + ylab("-log10(p.values)") +
+  geom_hline(yintercept=-log10(thres_env), linetype="dashed", color = gray(.80), size=0.6) +
+  facet_wrap(~"Manhattan plot", nrow = 3) +
+  guides(color=guide_legend(title="Locus type")) +
+  theme_bw(base_size = 11, base_family = "Times") +
+  theme(legend.position="right", legend.background = element_blank(), panel.grid = element_blank(), legend.box.background = element_blank(), plot.background = element_blank(), panel.background = element_blank(), legend.text=element_text(size=rel(.8)), strip.text = element_text(size=11))
+```
+
+
+```{r}
+uro_pal<-get_palette("Set2", k = 10)
+
+eigs<-as.data.frame(summary(eigenvals(pRDAclim, model = "constrained")))
+eigs
+
+eco<-rownames(Env)
+
+svg("D:/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/Final_plotsRDA_full_updated_ATL_20240812.svg", height = 10, width = 10)
+plot(pRDAfull, type="n", scaling=3,
+     xlab = paste0("RDA1 (",round(eigs[2,1]*100,2),"%)"),
+     ylab = paste0("RDA2 (",round(eigs[2,2]*100,2),"%)"))
+points(pRDAfull, display="species", pch=20, cex=0.7, col="gray32", scaling=3)           # the SNPs
+points(pRDAfull, display="sites", cex=1.3, scaling=3, bg = uro_pal[as.numeric(factor(eco))], pch = 21) 
+text(pRDAfull, scaling=3, display="bp", col="#0868ac", cex=1)                           # the predictors
+legend("topright", legend=levels(factor(eco)), bty="n", col="gray32", pch=21, cex=1, pt.bg=uro_pal)
+dev.off()
+
+
+load.rda <- scores(RDA_env, choices=c(1:3), display="species")
+
+hist(load.rda[,1], main="Loadings on RDA1")
+hist(load.rda[,2], main="Loadings on RDA2")
+hist(load.rda[,3], main="Loadings on RDA3")
+
+outliers2 <- function(x,z){
+  lims <- mean(x) + c(-1, 1) * z * sd(x)     # find loadings +/-z sd from mean loading     
+  x[x < lims[1] | x > lims[2]]               # locus names in these tails
+}
+
+cand1 <- outliers2(load.rda[,1],3) # 105
+cand2 <- outliers2(load.rda[,2],3) # 192
+cand3 <- outliers2(load.rda[,3],3) # 88
+
+
+ncand <- length(cand1) + length(cand2) + length(cand3)
+ncand
+
+cand1 <- cbind.data.frame(rep(1,times=length(cand1)), names(cand1), unname(cand1))
+cand2 <- cbind.data.frame(rep(2,times=length(cand2)), names(cand2), unname(cand2))
+cand3 <- cbind.data.frame(rep(3,times=length(cand3)), names(cand3), unname(cand3))
+
+
+colnames(cand1) <- colnames(cand2) <- colnames(cand3) <- c("axis","snp","loading")
+
+cand <- rbind(cand1, cand2, cand3)
+cand$snp <- as.character(cand$snp)
+
+foo <- matrix(nrow=(ncand), ncol=4)  # 4 columns for 4 predictors
+colnames(foo) <- colnames(Env)
+
+for (i in 1:length(cand$snp)) {
+  nam <- cand[i,2]
+  snp.gen <- AllFreq[,nam]
+  foo[i,] <- apply(Env,2,function(x) cor(x,snp.gen))
+}
+
+cand <- cbind.data.frame(cand,foo)  
+head(cand)
+
+length(cand$snp[duplicated(cand$snp)])  # 4 duplicate detections
+
+foo <- cbind(cand$axis, duplicated(cand$snp)) 
+table(foo[foo[,1]==1,2]) # no duplicates on axis 1
+
+table(foo[foo[,1]==2,2]) #  no duplicates on axis 2
+
+table(foo[foo[,1]==3,2]) # 4 duplicates on axis 3
+
+cand <- cand[!duplicated(cand$snp),] # remove duplicate detections
+
+for (i in 1:length(cand$snp)) {
+  bar <- cand[i,]
+  cand[i,8] <- names(which.max(abs(bar[4:7]))) # gives the variable
+  cand[i,9] <- max(abs(bar[4:7]))              # gives the correlation
+}
+
+colnames(cand)[8] <- "predictor"
+colnames(cand)[9] <- "correlation"
+
+table(cand$predictor)
+
+sel <- cand$snp
+env <- cand$predictor
+env[env=="annual_min"] <- '#1f78b4'
+env[env=="annual_mean"] <- '#6a3d9a'
+env[env=="annual_max"] <- '#e31a1c'
+env[env=="annual_range"] <- '#33a02c'
+
+# color by predictor:
+col.pred <- rownames(RDA_env$CCA$v) # pull the SNP names
+              
+for (i in 1:length(sel)) {           # color code candidate SNPs
+        foo <- match(sel[i],col.pred)
+        col.pred[foo] <- env[i]
+}
+              
+col.pred[grep(":",col.pred)] <- '#f1eef6' # non-candidate SNPs
+empty <- col.pred
+empty[grep("#f1eef6",empty)] <- rgb(0,1,0, alpha=0) # transparent
+empty.outline <- ifelse(empty=="#00FF0000","#00FF0000","gray32")
+bg <- c('#1f78b4','#6a3d9a','#e31a1c','#33a02c')
+
+# axes 1 & 2
+#png("./Re_analysis_2023/Final_plots/RDA_SNPs.png", height = 18, width = 18, units = "cm", res = 300)
+#pdf("/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/Final_plots/test.pdf")
+svg("/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/Final_plots/RDA_SNPs_RDAs1_2_ATL_updated_20240812.svg", height = 6, width = 6)
+plot(RDA_env, type="n", scaling=3, xlim=c(-0.25,0.25), ylim=c(-0.25,0.25))
+points(RDA_env, display="species", pch=21, cex=1, col="gray32", bg=col.pred, scaling=3)
+points(RDA_env, display="species", pch=21, cex=1, col=empty.outline, bg=empty, scaling=3)
+text(RDA_env, scaling=3, display="bp", col="#0868ac", cex=1)
+legend("bottomright", legend=c("annual_min","annual_mean","annual_max","annual_range"), bty="n", col="gray32", pch=21, cex=1, pt.bg=bg)
+dev.off()
+
+svg("/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/Final_plots/RDA_SNPs_RDAs2_3_ATL_updated_20240812.svg", height = 6, width = 6)
+plot(RDA_env, type="n", scaling=3, choices = c(2,3), xlim=c(-0.25,0.25), ylim=c(-0.25,0.25))
+points(RDA_env, display="species", pch=21, cex=1, col="gray32", bg=col.pred, scaling=3, choices = c(2,3))
+points(RDA_env, display="species", pch=21, cex=1, col=empty.outline, bg=empty, scaling=3, choices = c(2,3))
+text(RDA_env, scaling=3, choices = c(2,3), display="bp", col="#0868ac", cex=1)
+legend("bottomright", legend=c("annual_min","annual_mean","annual_max","annual_range"), bty="n", col="gray32", pch=21, cex=1, pt.bg=bg)
+dev.off()
+
+rda_snps<-cand$snp
+rda_snps<-gsub("_.*", "", rda_snps)
+write.table(file = "/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/PopGen/AF_preds/RDA_SNPS_20240812.txt", rda_snps ,col.names = F, row.names = F, quote = F, sep = "/t")
+```
+
+### SST MIN
+```{r}
+SST_min<-cand[cand$predictor == "annual_min",]
+min_loci<-SST_min$snp
+min_loci2<-gsub("_.*", "", min_loci)
+write.table(file = "/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/PopGen/AF_preds/RDA_SNPS_MinSST_Aug2024.txt", min_loci2 ,col.names = F, row.names = F, quote = F, sep = "/t")
+
+Freqs <- aggregate(Genotypes, by = list(Genotypes$Pop), function(x) mean(x, na.rm = T)/2)
+row.names(Freqs) <- as.character(Freqs$Group.1)
+cols<-which(colnames(Freqs) %in% min_loci)
+min_AFs<-Freqs[,sort(c(cols))]
+min_AFs$Pop<-rownames(min_AFs)
+
+Env2<-read.csv(file="./Re_analysis_2023/PopGen/environment_data/In_situ/environmental_summary_stats.csv",
+              header = T)
+rownames(Env2)<-Env2$Site
+Env2$Site<-NULL
+Env2 <- scale(Env2, center=TRUE, scale=TRUE)
+scale_env <- attr(Env2, 'scaled:scale')
+center_env <- attr(Env2, 'scaled:center')
+Env2 <- as.data.frame(Env2)
+Env2 <- dplyr::select(Env2, annual_min, annual_mean, annual_max, annual_range)
+Env2$Pop<-rownames(Env2)
+
+min_AFs<-merge(min_AFs, Env2, by = "Pop")
+coasts<-as.data.frame(cbind(min_AFs$Pop,
+                            rbind("ATL","PAC","ATL","ATL","ATL","ATL","ATL",
+                                  "PAC","ATL","ATL","PAC","ATL","PAC","ATL",
+                                  "PAC")))
+min_AFs<-merge(min_AFs, coasts, by.x = "Pop", by.y = "V1")
+
+#ggscatter(min_AFs, x = "annual_min", y = "286834:86_C", col = "Pop", shape = "V2")
+#ggsave(filename = "./PopGen/AF_preds/Example_1.svg", height = 16, width = 22, units = "cm",
+#       ex1)
+
+min_list<-list()
+for(q in 2:(ncol(min_AFs)-5)){
+  df<-min_AFs[,c(1,q)]
+  loc=colnames(df)[2]
+  df2<-merge(df, Env2, by = "Pop")
+  df2<-df2[,1:3]
+  df2<-merge(df2, coasts, by.x = "Pop", by.y = "V1")
+  df3<-df2[df2$V2 == "ATL",]
+  regr<-lm(df3[,2] ~ df3[,3])
+  summary(regr)
+  df2$Pred<-regr$coefficients[[2]] * df2$annual_min + regr$coefficients[[1]]
+  df2$Diff<-df2[,2] - df2$Pred
+  df4<-df2[df2$V2 == "PAC" |
+             df2$Pop == "WH" |
+             df2$Pop == "CT",]
+  WH_AF<-df4[6,2]
+  CT_AF<-df4[2,2]
+  df4$WH_diff<-df4[,2] - WH_AF
+  df4$CT_diff<-df4[,2] - CT_AF
+  df5<-df4[df4$V2 == "PAC",]
+  df5<-as.data.frame(rbind(cbind(df5$Pop, df5$Diff, "SST_regression"),
+             cbind(df5$Pop, df5$WH_diff, "Difference_to_WH"),
+             cbind(df5$Pop, df5$CT_diff, "Difference_to_CT")))
+  df5$V4<-loc
+  df5$V2<-as.numeric(df5$V2)
+  #ex2<-ggscatter(df5, x = "V1", y = "V2", col = "V3", xlab = "Invasive population",
+  #          ylab = "Difference in Allele Frequencies", legend.title = "Comparison") + 
+  #  geom_hline(yintercept = 0, lty = 2)
+  #ggsave(filename = "./PopGen/AF_preds/Example2.svg", ex2, width = 22, height = 16 , units = "cm")
+  
+  colnames(df5)<-c("Pop", "Obs_Exp", "Comparison", "Locus")
+  min_list[[q]]<-df5
+}
+min_Pred<-do.call(rbind, min_list)
+ggviolin(min_Pred, x = "Pop", y = "Obs_Exp", fill = "Comparison",
+         title = "Loci associated with annual minimum SSTs (n=85)") +
+  geom_hline(yintercept = 0, lty = 2)
+ggboxplot(min_Pred, x = "Pop", y = "Obs_Exp", fill = "Comparison",
+         title = "Loci associated with annual minimum SSTs (n=85)") +
+  geom_hline(yintercept = 0, lty = 2)
+
+ggdensity(data = SST_min, x = "correlation", y = "..density..")
+
+r07_loci<-SST_min[SST_min$correlation >= 0.5, 2]
+r07_min<-min_Pred[min_Pred$Locus %in% r07_loci,]
+
+viol<-ggviolin(r07_min, x = "Pop", y = "Obs_Exp", fill = "Comparison", xlab = "Invasive Population",
+               ylab = "Observed AFs - 'Expected' AFs") +
+  rotate_x_text(90) + 
+  geom_hline(yintercept = 0, lty = 2)
+ggsave(filename = "Re_analysis_2023/PopGen/AF_preds/min_SST_loci_r075_Aug2024.png", viol,
+       height = 12, width = 16, units = "cm")
+
+for(loc in 1:length(r07_loci)){
+  CT<-min_AFs[min_AFs$Pop == "CT", paste0(r07_loci[loc])]
+  WH<-min_AFs[min_AFs$Pop == "WH", paste0(r07_loci[loc])]
+  scat<-ggscatter(data = min_AFs, x = "annual_min", y = paste0(r07_loci[loc]),
+            col = "Pop", shape = "V2", size = 3, title = "SST_min") +
+    geom_hline(yintercept = CT, lty = 2) +
+    geom_hline(yintercept = WH, lty = 3)
+  locus<-gsub(":","_",paste0(r07_loci[loc]))
+  ggsave(filename = paste0("Re_analysis_2023/PopGen/AF_preds/scatter_plots/annual_min/",locus,"_Aug2024.png"), scat, height = 12, width = 16, units = "cm")
+}
+
+```
+
+### SST MAX
+```{r}
+SST_max<-cand[cand$predictor == "annual_max",]
+max_loci<-SST_max$snp
+max_loci2<-gsub("_.*", "", max_loci)
+write.table(file = "/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/PopGen/AF_preds/RDA_SNPS_MaxSST_Aug2024.txt", max_loci2 ,col.names = F, row.names = F, quote = F, sep = "/t")
+
+Freqs_max <- aggregate(Genotypes, by = list(Genotypes$Pop), function(x) mean(x, na.rm = T)/2)
+row.names(Freqs_max) <- as.character(Freqs_max$Group.1)
+cols<-which(colnames(Freqs_max) %in% max_loci)
+max_AFs<-Freqs_max[,sort(c(cols))]
+max_AFs$Pop<-rownames(max_AFs)
+
+max_AFs<-merge(max_AFs, Env2, by = "Pop")
+coasts<-as.data.frame(cbind(max_AFs$Pop,
+                            rbind("ATL","PAC","ATL","ATL","ATL","ATL","ATL",
+                                  "PAC","ATL","ATL","PAC","ATL","PAC","ATL",
+                                  "PAC")))
+max_AFs<-merge(max_AFs, coasts, by.x = "Pop", by.y = "V1")
+
+#ggscatter(max_AFs, x = "annual_max", y = "4320:76_T", col = "Pop", shape = "V2")
+
+max_list<-list()
+for(q in 2:(ncol(max_AFs)-5)){
+  df<-max_AFs[,c(1,q)]
+  loc=colnames(df)[2]
+  df2<-merge(df, Env2, by = "Pop")
+  df2<-df2[,1:5]
+  df2<-merge(df2, coasts, by.x = "Pop", by.y = "V1")
+  df3<-df2[df2$V2 == "ATL",]
+  regr<-lm(df3[,2] ~ df3[,3])
+  summary(regr)
+  df2$Pred<-regr$coefficients[[2]] * df2$annual_max + regr$coefficients[[1]]
+  df2$Diff<-df2[,2] - df2$Pred
+  df4<-df2[df2$V2 == "PAC" |
+             df2$Pop == "WH" |
+             df2$Pop == "CT",]
+  WH_AF<-df4[6,2]
+  CT_AF<-df4[2,2]
+  df4$WH_diff<-df4[,2] - WH_AF
+  df4$CT_diff<-df4[,2] - CT_AF
+  df5<-df4[df4$V2 == "PAC",]
+  df5<-as.data.frame(rbind(cbind(df5$Pop, df5$Diff, "SST_regression"),
+             cbind(df5$Pop, df5$WH_diff, "Difference_to_WH"),
+             cbind(df5$Pop, df5$CT_diff, "Difference_to_CT")))
+  df5$V4<-loc
+  df5$V2<-as.numeric(df5$V2)
+  ex2<-ggscatter(df5, x = "V1", y = "V2", col = "V3", xlab = "Invasive population",
+            ylab = "Difference in Allele Frequencies", legend.title = "Comparison") + 
+    geom_hline(yintercept = 0, lty = 2)
+  #ggsave(filename = "./PopGen/AF_preds/Example2.svg", ex2, width = 22, height = 16 , units = "cm")
+  
+  colnames(df5)<-c("Pop", "Obs_Exp", "Comparison", "Locus")
+  max_list[[q]]<-df5
+}
+max_Pred<-do.call(rbind, max_list)
+ggviolin(max_Pred, x = "Pop", y = "Obs_Exp", fill = "Comparison",
+         title = "Loci associated with annual maximum SSTs (n=85)") +
+  geom_hline(yintercept = 0, lty = 2)
+ggboxplot(max_Pred, x = "Pop", y = "Obs_Exp", fill = "Comparison",
+         title = "Loci associated with annual maximum SSTs (n=85)") +
+  geom_hline(yintercept = 0, lty = 2)
+
+ggdensity(data = SST_max, x = "correlation", y = "..density..")
+
+r07_loci<-SST_max[SST_max$correlation >= 0.55, 2]
+r07_max<-max_Pred[max_Pred$Locus %in% r07_loci,]
+
+viol<-ggviolin(r07_max, x = "Pop", y = "Obs_Exp", fill = "Comparison", xlab = "Invasive Population",
+               ylab = "Observed AFs - 'Expected' AFs") +
+  rotate_x_text(90) + 
+  geom_hline(yintercept = 0, lty = 2)
+ggsave(filename = "Re_analysis_2023/PopGen/AF_preds/max_SST_loci_r075_Aug2024.png", viol,
+       height = 12, width = 16, units = "cm")
+
+for(loc in 1:length(r07_loci)){
+  CT<-max_AFs[max_AFs$Pop == "CT", paste0(r07_loci[loc])]
+  WH<-max_AFs[max_AFs$Pop == "WH", paste0(r07_loci[loc])]
+  scat<-ggscatter(data = max_AFs, x = "annual_max", y = paste0(r07_loci[loc]),
+            col = "Pop", shape = "V2", size = 3, title = "SST_max") +
+    geom_hline(yintercept = CT, lty = 2) +
+    geom_hline(yintercept = WH, lty = 3)
+  locus<-gsub(":","_",paste0(r07_loci[loc]))
+  ggsave(filename = paste0("Re_analysis_2023/PopGen/AF_preds/scatter_plots/annual_max/",locus,"_Aug2024.png"), scat, height = 12, width = 16, units = "cm")
+}
+
+```
+
+### SST MEAN
+```{r}
+SST_mean<-cand[cand$predictor == "annual_mean",]
+mean_loci<-SST_mean$snp
+mean_loci2<-gsub("_.*", "", mean_loci)
+write.table(file = "/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/PopGen/AF_preds/RDA_SNPS_MeanSST_Aug2024.txt", mean_loci2 ,col.names = F, row.names = F, quote = F, sep = "/t")
+
+Freqs_mean <- aggregate(Genotypes, by = list(Genotypes$Pop), function(x) mean(x, na.rm = T)/2)
+row.names(Freqs_mean) <- as.character(Freqs_mean$Group.1)
+cols<-which(colnames(Freqs_mean) %in% mean_loci)
+mean_AFs<-Freqs_mean[,sort(c(cols))]
+mean_AFs$Pop<-rownames(mean_AFs)
+
+mean_AFs<-merge(mean_AFs, Env2, by = "Pop")
+coasts<-as.data.frame(cbind(mean_AFs$Pop,
+                            rbind("ATL","PAC","ATL","ATL","ATL","ATL","ATL",
+                                  "PAC","ATL","ATL","PAC","ATL","PAC","ATL",
+                                  "PAC")))
+mean_AFs<-merge(mean_AFs, coasts, by.x = "Pop", by.y = "V1")
+
+#ggscatter(mean_AFs, x = "annual_mean", y = "10718:123_T", col = "Pop", shape = "V2")
+
+mean_list<-list()
+for(q in 2:(ncol(mean_AFs)-5)){
+  df<-mean_AFs[,c(1,q)]
+  loc=colnames(df)[2]
+  df2<-merge(df, Env2, by = "Pop")
+  df2<-df2[,1:4]
+  df2<-merge(df2, coasts, by.x = "Pop", by.y = "V1")
+  df3<-df2[df2$V2 == "ATL",]
+  regr<-lm(df3[,2] ~ df3[,3])
+  summary(regr)
+  df2$Pred<-regr$coefficients[[2]] * df2$annual_mean + regr$coefficients[[1]]
+  df2$Diff<-df2[,2] - df2$Pred
+  df4<-df2[df2$V2 == "PAC" |
+             df2$Pop == "WH" |
+             df2$Pop == "CT",]
+  WH_AF<-df4[6,2]
+  CT_AF<-df4[2,2]
+  df4$WH_diff<-df4[,2] - WH_AF
+  df4$CT_diff<-df4[,2] - CT_AF
+  df5<-df4[df4$V2 == "PAC",]
+  df5<-as.data.frame(rbind(cbind(df5$Pop, df5$Diff, "SST_regression"),
+             cbind(df5$Pop, df5$WH_diff, "Difference_to_WH"),
+             cbind(df5$Pop, df5$CT_diff, "Difference_to_CT")))
+  df5$V4<-loc
+  df5$V2<-as.numeric(df5$V2)
+  ex2<-ggscatter(df5, x = "V1", y = "V2", col = "V3", xlab = "Invasive population",
+            ylab = "Difference in Allele Frequencies", legend.title = "Comparison") + 
+    geom_hline(yintercept = 0, lty = 2)
+  #ggsave(filename = "./PopGen/AF_preds/Example2.svg", ex2, width = 22, height = 16 , units = "cm")
+  
+  colnames(df5)<-c("Pop", "Obs_Exp", "Comparison", "Locus")
+  mean_list[[q]]<-df5
+}
+mean_Pred<-do.call(rbind, mean_list)
+ggviolin(mean_Pred, x = "Pop", y = "Obs_Exp", fill = "Comparison",
+         title = "Loci associated with annual mean SSTs") +
+  geom_hline(yintercept = 0, lty = 2)
+ggboxplot(mean_Pred, x = "Pop", y = "Obs_Exp", fill = "Comparison",
+         title = "Loci associated with annual meanm SSTs") +
+  geom_hline(yintercept = 0, lty = 2)
+
+ggdensity(data = SST_mean, x = "correlation", y = "..density..")
+
+r07_loci<-SST_mean[SST_mean$correlation >= 0.55, 2]
+r07_mean<-mean_Pred[mean_Pred$Locus %in% r07_loci,]
+
+viol<-ggviolin(r07_mean, x = "Pop", y = "Obs_Exp", fill = "Comparison", xlab = "Invasive Population",
+               ylab = "Observed AFs - 'Expected' AFs") +
+  rotate_x_text(90) + 
+  geom_hline(yintercept = 0, lty = 2)
+ggsave(filename = "Re_analysis_2023/PopGen/AF_preds/mean_SST_loci_r075_Aug2024.png", viol,
+       height = 12, width = 16, units = "cm")
+
+for(loc in 1:length(r07_loci)){
+  CT<-mean_AFs[mean_AFs$Pop == "CT", paste0(r07_loci[loc])]
+  WH<-mean_AFs[mean_AFs$Pop == "WH", paste0(r07_loci[loc])]
+  scat<-ggscatter(data = mean_AFs, x = "annual_mean", y = paste0(r07_loci[loc]),
+            col = "Pop", shape = "V2", size = 3, title = "SST_mean") +
+    geom_hline(yintercept = CT, lty = 2) +
+    geom_hline(yintercept = WH, lty = 3)
+  locus<-gsub(":","_",paste0(r07_loci[loc]))
+  ggsave(filename = paste0("Re_analysis_2023/PopGen/AF_preds/scatter_plots/annual_mean/",locus,".png"), scat, height = 12, width = 16, units = "cm")
+}
+
+```
+
+### SST RANGE
+```{r}
+SST_range<-cand[cand$predictor == "annual_range",]
+range_loci<-SST_range$snp
+range_loci2<-gsub("_.*", "", range_loci)
+write.table(file = "/Postdocs/UMass/Snails/FINAL_rerun/Re_analysis_2023/PopGen/AF_preds/RDA_SNPS_RangeSST_Aug2024.txt", range_loci2 ,col.names = F, row.names = F, quote = F, sep = "/t")
+
+Freqs_range <- aggregate(Genotypes, by = list(Genotypes$Pop), function(x) mean(x, na.rm = T)/2)
+row.names(Freqs_range) <- as.character(Freqs_range$Group.1)
+cols<-which(colnames(Freqs_range) %in% range_loci)
+range_AFs<-Freqs_range[,sort(c(cols))]
+range_AFs$Pop<-rownames(range_AFs)
+
+range_AFs<-merge(range_AFs, Env2, by = "Pop")
+coasts<-as.data.frame(cbind(range_AFs$Pop,
+                            rbind("ATL","PAC","ATL","ATL","ATL","ATL","ATL",
+                                  "PAC","ATL","ATL","PAC","ATL","PAC","ATL",
+                                  "PAC")))
+range_AFs<-merge(range_AFs, coasts, by.x = "Pop", by.y = "V1")
+
+#ggscatter(range_AFs, x = "annual_range", y = "237484:131_A", col = "Pop", shape = "V2")
+
+range_list<-list()
+for(q in 2:(ncol(range_AFs)-5)){
+  df<-range_AFs[,c(1,q)]
+  loc=colnames(df)[2]
+  df2<-merge(df, Env2, by = "Pop")
+  df2<-df2[,1:6]
+  df2<-merge(df2, coasts, by.x = "Pop", by.y = "V1")
+  df3<-df2[df2$V2 == "ATL",]
+  regr<-lm(df3[,2] ~ df3[,3])
+  summary(regr)
+  df2$Pred<-regr$coefficients[[2]] * df2$annual_range + regr$coefficients[[1]]
+  df2$Diff<-df2[,2] - df2$Pred
+  df4<-df2[df2$V2 == "PAC" |
+             df2$Pop == "WH" |
+             df2$Pop == "CT",]
+  WH_AF<-df4[6,2]
+  CT_AF<-df4[2,2]
+  df4$WH_diff<-df4[,2] - WH_AF
+  df4$CT_diff<-df4[,2] - CT_AF
+  df5<-df4[df4$V2 == "PAC",]
+  df5<-as.data.frame(rbind(cbind(df5$Pop, df5$Diff, "SST_regression"),
+             cbind(df5$Pop, df5$WH_diff, "Difference_to_WH"),
+             cbind(df5$Pop, df5$CT_diff, "Difference_to_CT")))
+  df5$V4<-loc
+  df5$V2<-as.numeric(df5$V2)
+  ex2<-ggscatter(df5, x = "V1", y = "V2", col = "V3", xlab = "Invasive population",
+            ylab = "Difference in Allele Frequencies", legend.title = "Comparison") + 
+    geom_hline(yintercept = 0, lty = 2)
+  #ggsave(filename = "./PopGen/AF_preds/Example2.svg", ex2, width = 22, height = 16 , units = "cm")
+  
+  colnames(df5)<-c("Pop", "Obs_Exp", "Comparison", "Locus")
+  range_list[[q]]<-df5
+}
+range_Pred<-do.call(rbind, range_list)
+ggviolin(range_Pred, x = "Pop", y = "Obs_Exp", fill = "Comparison",
+         title = "Loci associated with annual range SSTs") +
+  geom_hline(yintercept = 0, lty = 2)
+ggboxplot(range_Pred, x = "Pop", y = "Obs_Exp", fill = "Comparison",
+         title = "Loci associated with annual range SSTs") +
+  geom_hline(yintercept = 0, lty = 2)
+
+ggdensity(data = SST_range, x = "correlation", y = "..density..")
+
+r07_loci<-SST_range[SST_range$correlation >= 0.55, 2]
+r07_range<-range_Pred[range_Pred$Locus %in% r07_loci,]
+
+viol<-ggviolin(r07_range, x = "Pop", y = "Obs_Exp", fill = "Comparison", xlab = "Invasive Population",
+               ylab = "Observed AFs - 'Expected' AFs") +
+  rotate_x_text(90) + 
+  geom_hline(yintercept = 0, lty = 2)
+ggsave(filename = "Re_analysis_2023/PopGen/AF_preds/range_SST_loci_r075_Aug2024.png", viol,
+       height = 12, width = 16, units = "cm")
+
+for(loc in 1:length(r07_loci)){
+  CT<-range_AFs[range_AFs$Pop == "CT", paste0(r07_loci[loc])]
+  WH<-range_AFs[range_AFs$Pop == "WH", paste0(r07_loci[loc])]
+  scat<-ggscatter(data = range_AFs, x = "annual_range", y = paste0(r07_loci[loc]),
+            col = "Pop", shape = "V2", size = 3, title = "SST_range") +
+    geom_hline(yintercept = CT, lty = 2) +
+    geom_hline(yintercept = WH, lty = 3)
+  locus<-gsub(":","_",paste0(r07_loci[loc]))
+  ggsave(filename = paste0("Re_analysis_2023/PopGen/AF_preds/scatter_plots/annual_range/",locus,".png"), scat, height = 12, width = 16, units = "cm")
+}
+
+```
+
+
+### Combined plot
+```{r}
+min<-ggboxplot(r07_min, x = "Pop", y = "Obs_Exp", fill = "Comparison", xlab = "Invasive Population",
+               ylab = "Observed AFs - 'Expected' AFs", title = paste0("Min SST: n = ", length(levels(factor(r07_min$Locus))))) +
+  rotate_x_text(90) + 
+  geom_hline(yintercept = 0, lty = 2)
+max<-ggboxplot(r07_max, x = "Pop", y = "Obs_Exp", fill = "Comparison", xlab = "Invasive Population",
+               ylab = "Observed AFs - 'Expected' AFs", title = paste0("Max SST: n = ", length(levels(factor(r07_max$Locus))))) +
+  rotate_x_text(90) + 
+  geom_hline(yintercept = 0, lty = 2)
+mean<-ggboxplot(r07_mean, x = "Pop", y = "Obs_Exp", fill = "Comparison", xlab = "Invasive Population",
+               ylab = "Observed AFs - 'Expected' AFs", title = paste0("Mean SST: n = ", length(levels(factor(r07_mean$Locus))))) +
+  rotate_x_text(90) + 
+  geom_hline(yintercept = 0, lty = 2)
+range<-ggboxplot(r07_range, x = "Pop", y = "Obs_Exp", fill = "Comparison", xlab = "Invasive Population",
+               ylab = "Observed AFs - 'Expected' AFs", title = paste0("Range of SST: n = ", length(levels(factor(r07_range$Locus))))) +
+  rotate_x_text(90) + 
+  geom_hline(yintercept = 0, lty = 2)
+
+comb<-ggarrange(min, max, mean, range, common.legend = T)
+ggsave(filename = "Re_analysis_2023/PopGen/AF_preds/combined_boxplots_Aug2024.png", comb,
+       height = 22, width = 30, units = "cm")
+
+
+
+r07_min$Predictor<-"Min"
+r07_max$Predictor<-"Max"
+r07_mean$Predictor<-"Mean"
+r07_range$Predictor<-"Range"
+
+r07<-rbind(r07_min, r07_max, r07_mean, r07_range)
+
+tab1<-aggregate(r07$Obs_Exp ~ r07$Pop * r07$Comparison, FUN = "mean")
+tab1
+colnames(tab1)<-c("Pop", "Comparison", "Obs_Exp")
+
+ggbarplot(tab1, x = "Pop", y = "Obs_Exp", fill = "Comparison", position = position_dodge())
+```
+

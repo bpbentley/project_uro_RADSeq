@@ -1,0 +1,592 @@
+---
+title: 'Uro RAD PopGen: Final'
+author: "Blair Bentley"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+This script runs DPCA and Admixture analyses using VCF file generated through either Stacks de novo assembly, or reference-guided SNP calling from RAD-Seq data.
+
+***Load required libraries (quiet):***
+```{r pressure, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+library(hierfstat)
+library(mapdata)
+library(viridis)
+library(tidyr)
+library(adegenet)
+library(vcfR)
+library(ggplot2)
+library(poppr)
+library(ggpubr)
+library(wesanderson)
+library(reshape2)
+library(ape)
+library(poppr)
+library(dartR)
+library(strataG)
+library(StAMPP)
+```
+
+*Read in the VCF file, as well as population and region metadata, and convert to required formats:*
+Note that the population map should be two columns: sample ID and linked population.
+```{r, echo=T}
+vcf <- vcfR::read.vcfR("Data/final_data.vcf")
+pop <- read.table("./Data/popmapFiltered.txt", header=T, sep="\t", stringsAsFactors = TRUE)
+colnames(pop)<-c("Indiv","STRATA")
+region <- read.csv("../../uro_regions.csv", header = T)
+
+genind <- vcfR::vcfR2genind(vcf)
+genind@pop <- pop$STRATA # This line adds the population data. Make sure column header of V2 in pop is named STRATA (or edit here)
+genind@pop <- factor(genind@pop, levels = c("DM", "GB", "WH", "CT", "DB", "OY", "BF", "HP",
+                                             "FB", "SK", "WP", "HM", "RB", "TO", "CP"))
+tab1<-as.data.frame(table(genind@pop)) # Print the total number of samples used in the analyses per population.
+tab1
+
+uro_pal<-get_palette(palette = "Paired", k = 15)
+ggbarplot(tab1, x = "Var1", y = "Freq", fill = "Var1", palette = uro_pal,
+          legend = "none", xlab = "", ylab = "Number of individuals in analysis") +
+  font("ylab", face = "bold")
+
+
+## Check for dupes
+#gtypes<-genind2gtypes(x = genind)
+#dupGenotypes(g = gtypes, num.shared = 0.95)
+
+```
+
+## Combine library info for downstream analysis
+```{r}
+uro1<-read.table(file="../barcodes/Uro1_barcodes.txt")[2]
+uro1$lib<-"Uro1"
+uro2<-read.table(file="../barcodes/Uro2_barcodes.txt")[2]
+uro2$lib<-"Uro2"
+uro3<-read.table(file="../barcodes/Uro3_barcodes.txt")[2]
+uro3$lib<-"Uro3"
+urob<-read.table(file="../barcodes/UroBaby_barcodes.txt")[2]
+urob$lib<-"UroBaby"
+urob$V2<-gsub("_baby","",urob$V2)
+rem<-c(intersect(urob$V2, uro1$V2),
+       intersect(urob$V2, uro2$V2))
+urob<-subset(urob, !(V2 %in% rem))
+
+libs<-as.data.frame(rbind(uro1,uro2,uro3,urob))
+```
+
+
+*Show heterozygosity plots and values per population*
+```{r}
+het<-as.data.frame(t(genind@tab))
+hetl<-list()
+for(q in 1:ncol(het)){
+   df<-as.data.frame(het[,q])
+  sample<-colnames(het)[q]
+  df<-as.data.frame(df[!is.na(df),])
+  df2<-as.data.frame(df[df$`df[!is.na(df), ]` == 1,])
+  nHet<-nrow(df2)
+  nTot<-nrow(df)
+  hTot<-nHet/nTot
+  hdf<-as.data.frame(cbind(sample, nHet, nTot, hTot))
+  hdf$pop<-substr(hdf$sample, 1, 2)
+  hetl[[q]]<-hdf
+}
+hetdf<-do.call(rbind, hetl)
+hetdf$hTot<-as.numeric(hetdf$hTot)
+hetdf$nTot<-as.numeric(hetdf$nTot)
+hetdf$pop <- factor(hetdf$pop, levels = c("DM", "GB", "WH", "CT", "DB", "OY", "BF", "HP",
+                                             "FB", "SK", "WP", "HM", "RB", "TO", "CP"))
+
+aggregate(hetdf$hTot ~ hetdf$pop, FUN = "mean")
+#ggscatter(hetdf, x = "pop", y = "hTot", color = "pop", palette = uro_pal,
+#          xlab = "Population", ylab = "Heterozygosity", legend = "none") +
+#  font("xlab", face = "bold") + font("ylab", face = "bold")
+het_box<-ggboxplot(hetdf, x = "pop", y = "hTot", fill = "pop", palette = uro_pal,
+          xlab = "Population", ylab = "Observed heterozygosity (HOBS)", legend = "none",
+          add = "jitter", add.params = list(shape = 21)) +
+  rotate_x_text(45)
+het_box
+ggbarplot(hetdf, x = "pop", y = "nTot", add = "mean_se", fill = "pop",
+          legend = "none", palette = uro_pal, )
+ggsave(file="../Final_plots/Heterozygosity_per_site.svg", het_box,
+       height = 6, width = 8)
+
+```
+
+*Run the DAPC without any prior information*
+The first chunk here is to determine the optimal value of K (clusters) to use for downstream analyses using k-means clustering. As per the documenttaion from `find.clusters`:
+
+"The rule of thumb consists in increasing K until it no longer leads to an appreciable improvement of fit (i.e., to a decrease of BIC). In the most simple models (island models), BIC decreases until it reaches the optimal K, and then increases. In these cases, our rule amounts to choosing the lowest K. In other models such as stepping stones, the decrease of BIC often continues after the optimal K, but is much less steep."
+
+
+```{r, echo=TRUE}
+n_individuals<-nrow(pop)
+n_pops<-length(levels(factor(pop$STRATA)))
+
+grp_all <- find.clusters(genind, max.n.clust=n_pops, n.pca=200,
+                         choose.n.clust = FALSE)
+BIC<-as.data.frame(cbind(seq(1,n_pops,1), grp_all$Kstat))
+ggline(BIC, x = "V1", y = "V2", plot_type = "b",
+       col = "navy",
+       xlab = "Number of clusters (K)",
+       ylab = "BIC Value",
+       title = "Selection of optimum number of clusters (K)") +
+  font("xlab", face = "bold") + font("ylab", face = "bold")
+grp_all$Kstat
+
+```
+
+Based on the output of the plot above, we select the optimal value of K. In this case, K=5, and observe the number of samples per cluster:
+```{r, echo=TRUE}
+grp_all <- find.clusters(genind, max.n.clust=n_pops, n.pca=200, n.clust = 5)
+grp_all$size
+```
+
+Run the DPCA and generate the plots for visualizing
+Selecting the right number of DAs is important as it impacts the downstream outputs, and too many PCAs can leave to over-fitting the data.
+```{r}
+dapc <- dapc(genind, grp_all$grp, n.pca=60, n.da = 5, var.contrib = TRUE)
+pal <- get_palette("Accent", k=5)
+dpca_result <- scatter(dapc, col=pal, scree.pca = TRUE, posi.da = "topleft",
+                       pch = 20, cell = 0, cstar = 1,
+                       solid = 0.8, cex = 3, clab = 1)
+set.seed(4)
+#contrib<-loadingplot(dapc$var.contr,axis=2, thres=.002,lab.jitter=1)
+compoplot(dapc, posi="topleft", txt.leg=paste("Cluster",1:6),
+          ncol=1, xlab="Individuals", col=pal, lab=genind@pop, show.lab = T)
+dapc$IND <- row.names(dapc$ind.coord)
+dapc_info <- as.data.frame(cbind(dapc$IND, dapc$ind.coord, grp_all$grp))
+colnames(dapc_info) <- c("IND","DPC1", "DPC2", "DPC3", "DPC4", "DPC5", "K")
+dapc_info$SITE <- substr(dapc_info$IND, 1,2)
+dapc_info$SITE <- factor(dapc_info$SITE, levels = c("DM", "GB", "WH", "CT", "DB", "OY", "BF","HP","FB", "SK", "WP", "HM", "RB", "TO", "CP"))
+#dapc_info
+```
+
+*Now use the first DPCA to inform a secondary DPCA using priors*
+```{r, echo=TRUE}
+set.seed(5); dapc_a_score <- dapc(genind,n.pca=100,n.da=5) 
+temp_score <- optim.a.score(dapc_a_score)
+dapc2 <-dapc(genind, grp_all$grp, n.pca=12, n.da=5)
+dapc2$IND <- row.names(dapc2$ind.coord)
+dapc2_info <- as.data.frame(cbind(dapc2$IND, dapc2$ind.coord, grp_all$grp))
+
+dpca_result <- scatter(dapc2, col=pal, scree.pca = TRUE,
+                       pch = 20, cell = 0, cstar = 1,
+                       solid = 0.8, cex = 3, clab = 1, posi.da = "bottomleft",
+                       posi.pca = "bottomright")
+load_dpca2 <- as.data.frame(dapc2$var.contr)
+write.table(load_dpca2, "./Loadings_SNPs.txt", sep="\t", row.names=FALSE, quote=FALSE)
+percent= dapc2$eig/sum(dapc2$eig)*100
+barplot(percent, ylab="Percent of genetic variance explained by eigenvectors", names.arg=round(percent,2))
+dapc_prior=as.data.frame(dapc2$ind.coord)
+write.table(dapc_prior, "./DCPA_prior_results.txt", quote=F, sep="\t", row.names=TRUE)
+
+### Add information to the tab results of the DPCA
+dapc_prior$IND <- row.names(dapc_prior)
+
+### Add site info
+dapc_prior$SITE <- substr(dapc_prior$IND, 1,2)
+
+### Add 'region' info:
+dapc_prior<-merge(dapc_prior, region, by.x = "SITE", by.y = "Population")
+
+## Add library info
+#dapc_prior<-merge(dapc_prior, libs, by.x = "IND", by.y = "V2")
+
+### Make a ggplot graph representing the DAPC for the first and second axes for the regions
+uro_pal<-get_palette(palette = "Paired", k = 15)
+#region_pal<-wes_palette("Royal1",n = 3)
+
+LD1_v<-dapc2$eig[1]/sum(dapc2$eig)
+dapc1<-ggscatter(dapc_prior, x = "LD1", y = "LD2", shape = "Coast", color = "SITE", size = 3,
+          xlab = "DA1 (53.1%)", ylab = "DA2 (26.3%)", palette = uro_pal, alpha = 0.67)
+dapc1
+#ggscatter(dapc_prior, x = "LD1", y = "LD2", shape = 21, fill = "Region", size = 4,
+#          xlab = "DA1 (30.9%)", ylab = "DA2 (29.9%)", palette = region_pal)
+
+### Save the ggplot graph
+ggsave("./../Final_plots/DPCA_updated_2023.svg",dapc1,width=12,height=10,dpi=600,units="cm")
+
+```
+
+## PCA 
+Proportion of variation explained by PCA axes
+```{r, echo = FALSE}
+genl<-vcfR2genlight(vcf)
+genl@pop<-pop$STRATA
+pca1 <- glPca(genl,center = T, scale = T, nf = 5)
+barplot(100*pca1$eig/sum(pca1$eig), col = heat.colors(50), main="PCA Eigenvalues") # retain first 5 axes, incremental decrease after 2
+title(ylab="Percent of variance\nexplained", line = 2)
+title(xlab="Eigenvalues", line = 1)
+
+#proportion of explained variance by first three axes
+a1<-pca1$eig[1]/sum(pca1$eig) # proportion of variation explained by 1st axis
+a2<-pca1$eig[2]/sum(pca1$eig) # proportion of variation explained by 2nd axis 
+a3<-pca1$eig[3]/sum(pca1$eig) # proportion of variation explained by 3rd axis
+pcvar <- data.frame(Axis = c(1:3), Proportion = c(a1,a2,a3))
+pcvar
+```
+
+### Extract PC scores to color by location/yr:
+(adapted from [Grunwald lab github](https://github.com/grunwaldlab/Population_Genetics_in_R/blob/master/gbs_analysis.Rmd#principal-components-analysis))
+```{r, fig.width = 6,fig.height = 6, echo = FALSE}
+pca1.scores <- as.data.frame(pca1$scores)
+pca1.scores$pop <- pop(genl)
+pca1.scores$reg <- pca1.scores$pop
+pca1.scores$ind <- genl@ind.names
+pca1.scores<-merge(pca1.scores, region, by.x = "pop", by.y = "Population")
+#pca1.scores<-merge(pca1.scores, libs, by.x = "ind", by.y = "V2")
+```
+
+### Generate PCA plots
+```{r}
+set.seed(89)
+num_pops <- length(levels(factor(pop$pop)))
+
+# plot PC 1 and 2
+pca1.p<-ggscatter(pca1.scores, x = "PC1", y = "PC2", shape = "Coast", color = "pop",
+          palette = uro_pal, ellipse = T, ellipse.level = 0.95, size = 3,
+          xlab = paste0("PC1 (",round(pcvar[1,2]*100,2),"%)"),
+          ylab = paste0("PC2 (",round(pcvar[2,2]*100,2),"%)"))
+pca1.p
+
+# #plot  PC 2 and 3: not informative for this dataset
+pca2.p<-ggscatter(pca1.scores, x = "PC2", y = "PC3", shape = "Coast", color = "pop",
+          palette = uro_pal, ellipse = T, ellipse.level = 0.95,
+          xlab = paste0("PC2 (",round(pcvar[2,2]*100,2),"%)"),
+          ylab = paste0("PC3 (",round(pcvar[3,2]*100,2),"%)"))
+pca2.p
+
+ggsave("../Final_plots/Uro_Full_PCA_Axes1_2.svg",pca1.p,width=16,height=16,dpi=600,units="cm")
+```
+
+## Genetic Diversity and FST
+## Genetic distance between locality and year combos. This is FST but can easily change
+## Recommend running the pair-wise FST estimate ONCE, then writing a file to read in for next steps to avoid ~20 min run times each time the chunk is run
+```{r, echo = FALSE}
+#pop.fst <- genet.dist(genind, method = "WC84") # Run time ~20 mins
+#pop.fst.df <- as.data.frame(as.matrix(round(pop.fst, 3)))
+#pop.fst.df
+#write.csv(pop.fst.df,"Uro_pairwise_Fst_Final_Filtered_Aug2024.csv")
+pop.fst.df<-read.csv(file="./Uro_pairwise_Fst_Final_Filtered_Aug2024.csv", header = T)
+row.names(pop.fst.df)<-pop.fst.df$X
+pop.fst.df$X<-NULL
+
+pop.fst.tri <- pop.fst.df
+rownames(pop.fst.df)<-colnames(pop.fst.df)
+pop.fst.tri[lower.tri(pop.fst.df, diag=TRUE)] <- NA
+rownames(pop.fst.tri)<-colnames(pop.fst.tri)
+fst.mat = data.matrix(pop.fst.tri)
+melted <- melt(fst.mat, na.rm =TRUE)
+
+fst_plot<-ggplot(data = melted, aes(Var2, Var1, fill = value))+ geom_tile(color = "white")+ scale_fill_gradient(low = "gray", high = "navy", name="FST")  + ggtitle(expression(atop("Pairwise FST, WC (1984)", atop(italic("N = 183, L = 9,956"), ""))))+labs( x = "Population", y = "Population") + theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 11, hjust = 1),axis.text.y = element_text(size = 12)) + coord_fixed() + theme_classic()
+fst_plot
+
+ggsave(filename = "../Final_plots/Pairwise_Fst_all_loci.svg", fst_plot, height = 12, width = 12, units = "cm")
+
+gtype<-genind2gtypes(genind)
+pws1<-pairwiseTest(gtype, stats = c("fst"),nrep = 100, write.output=TRUE, max.cores = 8, na.rm = T)
+
+list1<-list()
+for(q in 1:length(pws1)){
+  df<-as.data.frame(pws1[[q]]$result)
+  df$pair<-paste0(rownames(as.data.frame(pws1[[q]]$strata.freq[1])),"-",
+                  rownames(as.data.frame(pws1[[q]]$strata.freq[2])))
+  list1[[q]]<-df
+}
+pairwise<-do.call(rbind, list1)
+write.csv(file="pairwise_Fst_Pvalues.csv", pairwise, quote = F)
+
+pairwise$Test<-row.names(pairwise)
+pairwise$Test<-gsub('[[:digit:]]+', '', pairwise$Test)
+pairwiseFstP<-pairwise[pairwise$Test == "wcFst",]
+
+#genl<-vcfR2genlight(vcf)
+#genl@pop<-pop$STRATA
+### Using StAMPP:
+#stamppFst(genl, nboots = 1000, percent = 95, nclusters = 4)
+
+
+```
+
+### Admixture:
+```{r, warning=FALSE, message=FALSE}
+library(ggpubr)
+
+#K selection:
+kselect<-read.table(file="../PopGen/Admix/Aug2024/kselect.txt")
+vals<-c(10,11,12,13,14,2,3,4,5,6,7,8,9)
+kselect<-as.data.frame(cbind(vals, kselect$V4))
+kselect<-kselect[order(kselect$vals),]
+ggline(data = kselect, x = "vals", y= "V2", plot_type = "l",
+       xlab = "K-value", ylab = "Cross-validation score")
+#K=5
+
+popmap<-read.table(file="../PopGen/Data/popmapFiltered.txt", header = T)
+admix<-read.table(file="../PopGen/Admix/Aug2024/final_data.5.Q")
+admix<-cbind(admix,popmap)
+
+admix2<-list()
+for(q in 1:(ncol(admix)-2)){
+  df<-as.data.frame(admix[,c(q,(ncol(admix)-1),ncol(admix))])
+  df$K<-q
+  colnames(df)<-c("V1","V2","V3","V4")
+  admix2[[q]]<-df
+}
+admix2<-do.call(rbind, admix2)
+colnames(admix2)<-c("Prop","Sample","Pop","K")
+admix2$K<-as.factor(admix2$K)
+
+admix_pal<-c("#E6EBED","#FFC100", "#1E9ADF", "#636466", "#063852", "black")
+korder<-admix2[c(1:length(levels(factor(admix2$Sample)))),2]
+ggbarplot(admix2, x = "Sample", y = "Prop", fill = "K", order = korder, palette = admix_pal)
+
+#remotes::install_github('royfrancis/pophelper')
+library(pophelper)
+slist1<-readQ("../PopGen/Admix/Aug2024/final_data.6.Q",filetype="basic")
+slist1 <- alignK(slist1[1])
+labset_order = popmap[,2,drop=FALSE]
+colnames(labset_order)<-"STRATA"
+labset_order$STRATA <- as.character(labset_order$STRATA)
+plotQ(slist1,  clustercol= admix_pal, grplab = labset_order, grplabsize=3,
+      showsp=FALSE, ordergrp=F, imgtype="pdf", exportpath = getwd(),
+      showlegend=TRUE, legendpos="right", legendkeysize = 6, legendtextsize = 6,
+      legendmargin=c(2,2,2,0), width=20, height=5, sortind="all", subsetgrp = c("WP","HM","TO","RB","CP",                                                   "DM","GB","WH","CT","DB",                                                         "OY","BF","HP","FB","SK"),
+      outputfilename = "../Final_plots/Admixture_out_final_6")
+
+```
+
+### FastStructure outputs
+```{r}
+fs<-read.table(file="fastStructure/Uro_Final_Filtered.5.meanQ")
+fs<-as.data.frame(cbind(pop, fs))
+slist2<-readQ("fastStructure/Uro_Final_Filtered.5.meanQ",filetype="basic")
+slist2 <- alignK(slist2[1])
+labset_order = popmap[,2,drop=FALSE]
+colnames(labset_order)<-"STRATA"
+labset_order$STRATA <- as.character(labset_order$STRATA)
+plotQ(slist2,  clustercol= admix_pal, grplab = labset_order, grplabsize=3,
+      showsp=FALSE, ordergrp=F, imgtype="pdf", exportpath = getwd(),
+      showlegend=TRUE, legendpos="right", legendkeysize = 6, legendtextsize = 6,
+      legendmargin=c(2,2,2,0), width=20, height=5, sortind="Cluster1",
+      outputfilename ="../Final_plots/fastStructure_out_final", subsetgrp = c("DM","GB","WH","CT","DB",
+                                                         "OY","BF","HP","FB","SK",
+                                                         "WP","HM","TO","RB","CP"))
+
+```
+
+### IBD with just East coast samples:
+```{r, warning=FALSE, message=FALSE}
+eastl<-popsub(genl, sublist = c("BF","CT","DB","DM",
+                                "FB","GB","HP","OY",
+                                "SK","WH"))
+
+latlon<-as.data.frame(cbind(region$Population,
+                            region$lat,
+                            region$lon))
+samples<-as.data.frame(eastl$pop)
+alllatlon<-merge(samples, latlon, by.x = "eastl$pop", by.y = "V1")
+latlon<-alllatlon[,2:3]
+colnames(latlon)<-c("lat","lon")
+latlon$lat<-as.numeric(latlon$lat)
+latlon$lon<-as.numeric(latlon$lon)
+eastl@other$latlong<-latlon
+ibd_east<-gl.ibd(eastl, paircols = "pop")
+#plot(ibd_east)
+
+ibd_df<-as.data.frame(cbind(ibd_east$Dgen, ibd_east$Dgeo))
+ibd_df$Km<-ibd_df$V2/1000
+
+ibd_plot2<-ggscatter(data=ibd_df, x = "Km", y = "V1", xlab = "Geographic distance (km)",
+          ylab = "Genetic distance (Fst)", add = "reg.line") +
+  font("xlab", face = "bold") +  font("ylab", face = "bold")
+ibd_plot2
+ggsave(filename = "../Final_plots/IBD_plot_final.svg", ibd_plot2, height = 12, width = 12, units = "cm")
+```
+
+### PCA for West Coast/Mid-Atlantic
+```{r}
+MAW<-popsub(genl, sublist = c("CT", "WH", "RB", "TO",
+                              "WP", "HM", "CP"))
+pca2 <- glPca(MAW,center = T, scale = T, nf = 5)
+barplot(100*pca2$eig/sum(pca2$eig), col = heat.colors(50), main="PCA Eigenvalues") # retain first 5 axes, incremental decrease after 2
+title(ylab="Percent of variance\nexplained", line = 2)
+title(xlab="Eigenvalues", line = 1)
+
+#proportion of explained variance by first three axes
+a1<-pca2$eig[1]/sum(pca2$eig) # proportion of variation explained by 1st axis
+a2<-pca2$eig[2]/sum(pca2$eig) # proportion of variation explained by 2nd axis 
+a3<-pca2$eig[3]/sum(pca2$eig) # proportion of variation explained by 3rd axis
+pcvar <- data.frame(Axis = c(1:3), Proportion = c(a1,a2,a3))
+pcvar
+
+pca2.scores <- as.data.frame(pca2$scores)
+pca2.scores$pop <- pop(MAW)
+pca2.scores$reg <- pca2.scores$pop
+pca2.scores$ind <- MAW@ind.names
+pca2.scores<-merge(pca2.scores, region, by.x = "pop", by.y = "Population")
+pca2.scores<-merge(pca2.scores, libs, by.x = "ind", by.y = "V2")
+
+set.seed(9)
+num_pops <- 7
+
+# plot PC 1 and 2
+pca3.p<-ggscatter(pca2.scores, x = "PC1", y = "PC2", shape = "Coast", color = "pop",
+          palette = uro_pal[c(2,3,8,11,13,14,15)], ellipse = T, ellipse.level = 0.95, size = 3,
+          xlab = paste0("PC1 (",round(pcvar[1,2]*100,2),"%)"),
+          ylab = paste0("PC2 (",round(pcvar[2,2]*100,2),"%)"))
+pca3.p
+
+# #plot  PC 2 and 3: not informative for this dataset
+pca4.p<-ggscatter(pca2.scores, x = "PC2", y = "PC3", shape = "Coast", color = "pop",
+          palette = uro_pal, ellipse = T, ellipse.level = 0.95,
+          xlab = paste0("PC2 (",round(pcvar[2,2]*100,2),"%)"),
+          ylab = paste0("PC3 (",round(pcvar[3,2]*100,2),"%)"))
+pca4.p
+
+ggsave("../Final_plots/Uro_MWA_PCA_Axes1_2.svg",pca3.p,width=12,height=12,dpi=600,units="cm")
+
+```
+
+### DAPC for mid-Atlantic/Pacific
+```{r, echo=TRUE}
+genind_pac<-popsub(genind, sublist =c("CT", "WH", "RB", "TO",
+                              "WP", "HM", "CP"))
+n_pops<-7
+
+grp_all_pac <- find.clusters(genind_pac, max.n.clust=n_pops, n.pca=200,
+                         choose.n.clust = FALSE)
+BIC<-as.data.frame(cbind(seq(1,n_pops,1), grp_all_pac$Kstat))
+ggline(BIC, x = "V1", y = "V2", plot_type = "b",
+       col = "navy",
+       xlab = "Number of clusters (K)",
+       ylab = "BIC Value",
+       title = "Selection of optimum number of clusters (K)") +
+  font("xlab", face = "bold") + font("ylab", face = "bold")
+#grp_all$Kstat
+
+#K=3
+
+dapc <- dapc(genind_pac, grp_all_pac$grp, n.pca=60, n.da = 3, var.contrib = TRUE)
+pal <- get_palette("Accent", k=3)
+dpca_result <- scatter(dapc, col=pal, scree.pca = TRUE, posi.da = "topleft",
+                       pch = 20, cell = 0, cstar = 1,
+                       solid = 0.8, cex = 3, clab = 1)
+set.seed(4)
+#contrib<-loadingplot(dapc$var.contr,axis=2, thres=.002,lab.jitter=1)
+compoplot(dapc, posi="topleft", txt.leg=paste("Cluster",1:3),
+          ncol=1, xlab="Individuals", col=pal, lab=genind_pac@pop, show.lab = T)
+dapc$IND <- row.names(dapc$ind.coord)
+dapc_info <- as.data.frame(cbind(dapc$IND, dapc$ind.coord, grp_all_pac$grp))
+colnames(dapc_info) <- c("IND","DPC1", "DPC2", "K")
+dapc_info$SITE <- substr(dapc_info$IND, 1,2)
+dapc_info$SITE <- factor(dapc_info$SITE, levels = c("WH", "CT", "WP", "HM", "RB", "TO", "CP"))
+
+### Re-run using DAPC 1
+
+set.seed(5); dapc_a_score <- dapc(genind_pac,n.pca=100,n.da=10) 
+temp_score <- optim.a.score(dapc_a_score)
+dapc2 <-dapc(genind_pac, grp_all_pac$grp, n.pca=10, n.da=3)
+dapc2$IND <- row.names(dapc2$ind.coord)
+dapc2_info <- as.data.frame(cbind(dapc2$IND, dapc2$ind.coord, grp_all_pac$grp))
+
+dpca_result <- scatter(dapc2, col=pal, scree.pca = TRUE,
+                       pch = 20, cell = 0, cstar = 1,
+                       solid = 0.8, cex = 3, clab = 1, posi.da = "bottomleft",
+                       posi.pca = "bottomright")
+load_dpca2 <- as.data.frame(dapc2$var.contr)
+#write.table(load_dpca2, "./Loadings_SNPs.txt", sep="\t", row.names=FALSE, quote=FALSE)
+percent= dapc2$eig/sum(dapc2$eig)*100
+barplot(percent, ylab="Percent of genetic variance explained by eigenvectors", names.arg=round(percent,2))
+dapc_prior=as.data.frame(dapc2$ind.coord)
+#write.table(dapc_prior, "./DCPA_prior_results.txt", quote=F, sep="\t", row.names=TRUE)
+
+### Add information to the tab results of the DPCA
+dapc_prior$IND <- row.names(dapc_prior)
+
+### Add site info
+dapc_prior$SITE <- substr(dapc_prior$IND, 1,2)
+
+### Add 'region' info:
+dapc_prior<-merge(dapc_prior, region, by.x = "SITE", by.y = "Population")
+
+## Add library info
+#dapc_prior<-merge(dapc_prior, libs, by.x = "IND", by.y = "V2")
+
+### Make a ggplot graph representing the DAPC for the first and second axes for the regions
+uro_pal2<-get_palette(palette = "Paired", k = 15)[c(3,8,10,11,13,14,15)]
+#region_pal<-wes_palette("Royal1",n = 3)
+dapc1<-ggscatter(dapc_prior, x = "LD1", y = "LD2", shape = "Coast", color = "SITE", size = 3,
+          xlab = "DA1 (67.9%)", ylab = "DA2 (32.1%)", palette = uro_pal2, alpha = 0.67)
+dapc1
+#ggscatter(dapc_prior, x = "LD1", y = "LD2", shape = 21, fill = "Region", size = 4,
+#          xlab = "DA1 (30.9%)", ylab = "DA2 (29.9%)", palette = region_pal)
+
+### Save the ggplot graph
+ggsave("./../Final_plots/DAPC_MA-Pacific_Aug2024.svg",dapc1,width=12,height=10,dpi=600,units="cm")
+
+```
+
+## Admix for invasive
+```{r, warning=FALSE, message=FALSE}
+popmap<-read.table(file="../PopGen/Data/popmapFiltered.txt", header = T)
+invasive<-c("WH", "CT", "WP", "HM", "RB", "TO", "CP")
+popmap2<-popmap[popmap$STRATA %in% invasive,]
+
+admix<-read.table(file="../PopGen/Admix/Aug2024/invasive_subset/invasive_subset.3.Q")
+admix<-cbind(admix,popmap2)
+
+admix2<-list()
+for(q in 1:(ncol(admix)-2)){
+  df<-as.data.frame(admix[,c(q,(ncol(admix)-1),ncol(admix))])
+  df$K<-q
+  colnames(df)<-c("V1","V2","V3","V4")
+  admix2[[q]]<-df
+}
+admix2<-do.call(rbind, admix2)
+colnames(admix2)<-c("Prop","Sample","Pop","K")
+admix2$K<-as.factor(admix2$K)
+
+admix_pal<-c("#E6EBED","#FFC100", "#1E9ADF", "#636466", "#063852", "black")
+korder<-admix2[c(1:length(levels(factor(admix2$Sample)))),2]
+ggbarplot(admix2, x = "Sample", y = "Prop", fill = "K", order = korder, palette = admix_pal)
+
+#remotes::install_github('royfrancis/pophelper')
+library(pophelper)
+slist1<-readQ("../PopGen/Admix/Aug2024/invasive_subset/invasive_subset.4.Q",filetype="basic")
+slist1 <- alignK(slist1[1])
+labset_order = popmap2[,2,drop=FALSE]
+colnames(labset_order)<-"STRATA"
+labset_order$STRATA <- as.character(labset_order$STRATA)
+plotQ(slist1,  clustercol= admix_pal, grplab = labset_order, grplabsize=3,
+      showsp=FALSE, ordergrp=F, imgtype="pdf", exportpath = getwd(),
+      showlegend=TRUE, legendpos="right", legendkeysize = 6, legendtextsize = 6,
+      legendmargin=c(2,2,2,0), width=20, height=5, sortind="all", subsetgrp = c("WH", "CT", "WP", "HM", "TO", "RB", "CP"),
+      outputfilename = "../Final_plots/Admixture_invasive_4")
+
+```
+
+### Environmental data for Fig 1
+```{r}
+env_data_l<-list.files(path="../PopGen/environment_data/In_situ/Annual_means/",
+                       pattern = "csv")
+env_data<-list()
+for(q in 1:length(env_data_l)){
+  df<-read.csv(file=paste0("../PopGen/environment_data/In_situ/Annual_means/",env_data_l[q]))
+  df$X<-NULL
+  df$Site2<-gsub(":.*","",df$Site)
+  env_data[[q]]<-df
+}
+env_data<-do.call(rbind, env_data)
+env_data$DOY<-as.Date(env_data$DOY)
+
+env_data<-env_data[env_data$Site2 != "GBw",]
+
+temps<-ggline(env_data, x = "DOY", y = "SST", col = "Site2", plot_type = "l",
+       palette = uro_pal, size = 1.5)
+temps
+
+ggsave(filename = "../../Re_analysis_2023/Final_plots/temperature_summary_plot.svg",
+       temps)
+```
+
